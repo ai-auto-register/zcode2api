@@ -1,10 +1,11 @@
-"""验证码求解（WebSocket 模式）。
+"""验证码求解（无浏览器）。
 
-页面客户端通过 WebSocket 连接，完成阿里云无痕验证后将 verifyParam 提交回来。
-网关需要验证码时，若缓存失效则等待 WS 客户端提交结果。
+通过 Node + jsdom 在模拟浏览器环境中运行阿里云无痕 SDK，
+求得 verifyParam（X-Aliyun-Captcha-Verify-Param）。不再启动真实浏览器。
 
 - 缓存：求得的 verifyParam 在 TTL 内复用
-- 并发：同一时刻只等待一个求解结果，其余请求等待后命中缓存
+- 并发：同一时刻只跑一个求解进程，其余请求等待后命中缓存
+- 重试：单次求解偶发失败时自动重试
 """
 
 from __future__ import annotations
@@ -12,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import time
 
-from fastapi import WebSocket
+import httpx
 
 from . import logs, settings
 
@@ -24,22 +25,9 @@ class CaptchaManager:
         self._lock = asyncio.Lock()
         self._config_cache: dict | None = None
         self._config_cache_at: float = 0.0
-        self._pending: asyncio.Future[str] | None = None
-        self._ws_clients: list[WebSocket] = []
-        self._last_config: dict | None = None
-
-    @property
-    def last_config(self) -> dict | None:
-        return self._last_config
-
-    @property
-    def ws_clients(self) -> list[WebSocket]:
-        return self._ws_clients
 
     # ── 配置 ─────────────────────────────────────────────────────────────────
     async def fetch_config(self) -> dict:
-        import httpx
-
         now = time.time() * 1000
         if self._config_cache and now - self._config_cache_at < settings.CAPTCHA_CONFIG_CACHE_TTL:
             return self._config_cache
@@ -54,13 +42,10 @@ class CaptchaManager:
             if captcha:
                 self._config_cache = captcha
                 self._config_cache_at = now
-                self._last_config = captcha
                 return captcha
         except (httpx.HTTPError, ValueError) as err:
             logs.warn("captcha", f"获取配置失败，使用默认: {err}")
-        default = {"enabled": True, "prefix": "no8xfe", "region": "sgp", "sceneId": "11xygtvd"}
-        self._last_config = default
-        return default
+        return {"enabled": True, "prefix": "no8xfe", "region": "sgp", "sceneId": "11xygtvd"}
 
     # ── 求解 ─────────────────────────────────────────────────────────────────
     async def get_verify_param(self, port: int | None = None) -> str:
@@ -69,61 +54,62 @@ class CaptchaManager:
             return self._cached
 
         async with self._lock:
+            # 二次检查：等锁期间可能已被其他请求填充
             if self._cached and time.time() * 1000 - self._cached_at < settings.CAPTCHA_CACHE_TTL:
                 return self._cached
 
             config = await self.fetch_config()
-            await self._request_solve(config)
+            param = await self._solve(config)
+            self._cached = param
+            self._cached_at = time.time() * 1000
+            return param
 
-            if self._pending and not self._pending.done():
-                try:
-                    param = await asyncio.wait_for(
-                        asyncio.shield(self._pending),
-                        timeout=settings.CAPTCHA_SOLVE_TIMEOUT,
-                    )
-                except asyncio.TimeoutError:
-                    self._pending = None
-                    raise RuntimeError("验证码求解超时，页面客户端未响应")
-                self._pending = None
-                if param:
-                    self._cached = param
-                    self._cached_at = time.time() * 1000
-                    return param
-                raise RuntimeError("验证码求解返回空结果")
-
-            if self._cached:
-                return self._cached
-            raise RuntimeError("验证码求解失败")
-
-    async def _request_solve(self, config: dict) -> None:
-        if self._pending and not self._pending.done():
-            return
-        self._pending = asyncio.get_running_loop().create_future()
+    async def _solve(self, config: dict) -> str:
         scene = config.get("sceneId") or "11xygtvd"
         region = config.get("region") or "sgp"
         prefix = config.get("prefix") or "no8xfe"
-        task = {"type": "solve", "scene": scene, "region": region, "prefix": prefix}
-        dead = []
-        for ws in self._ws_clients:
+
+        last_err: str | None = None
+        for attempt in range(1, settings.CAPTCHA_SOLVE_RETRIES + 1):
             try:
-                await ws.send_json(task)
-            except Exception:
-                dead.append(ws)
-        for ws in dead:
-            self._ws_clients.remove(ws)
+                param = await self._run_solver(scene, region, prefix)
+            except Exception as err:  # noqa: BLE001
+                last_err = str(err)
+                param = None
+            if param:
+                if attempt > 1:
+                    logs.ok("captcha", f"求解成功（第 {attempt} 次尝试）")
+                return param
+            logs.warn("captcha", f"第 {attempt}/{settings.CAPTCHA_SOLVE_RETRIES} 次求解未果，重试…")
 
-    def submit_result(self, param: str) -> None:
-        if self._pending and not self._pending.done():
-            self._pending.set_result(param)
-        self._cached = param
-        self._cached_at = time.time() * 1000
+        raise RuntimeError(f"验证码求解失败: {last_err or '多次重试无结果'}")
 
-    def register_ws(self, ws: WebSocket) -> None:
-        self._ws_clients.append(ws)
+    async def _run_solver(self, scene: str, region: str, prefix: str) -> str | None:
+        if not settings.CAPTCHA_SOLVER_JS.exists():
+            raise RuntimeError(
+                f"未找到求解器 {settings.CAPTCHA_SOLVER_JS}，请先在 captcha_node 下执行 npm install"
+            )
+        proc = await asyncio.create_subprocess_exec(
+            settings.NODE_PATH, str(settings.CAPTCHA_SOLVER_JS), scene, region, prefix,
+            cwd=str(settings.CAPTCHA_SOLVER_DIR),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=settings.CAPTCHA_SOLVE_TIMEOUT)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            return None
+        except FileNotFoundError as err:
+            raise RuntimeError(f"无法启动 Node（{settings.NODE_PATH}）: {err}") from err
 
-    def unregister_ws(self, ws: WebSocket) -> None:
-        if ws in self._ws_clients:
-            self._ws_clients.remove(ws)
+        for line in stdout.decode("utf-8", "ignore").splitlines():
+            if line.startswith("VERIFY_PARAM="):
+                return line[len("VERIFY_PARAM="):].strip()
+        return None
 
     def invalidate(self) -> None:
         self._cached = None

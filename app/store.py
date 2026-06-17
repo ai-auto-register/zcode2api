@@ -1,25 +1,129 @@
-"""账号与设置的持久化存储（SQLite）。
+"""账号与设置的持久化存储。
 
-数据保存在项目本目录下的 data/accounts.db，采用 WAL 模式，
-与 grok2api 的本地 (local) 账号后端保持一致。
+数据保存在外部数据库（通过 DATABASE_URL 配置，支持 PostgreSQL / MySQL）
+或项目本目录下的 data/accounts.db (SQLite)，采用 WAL 模式。
 
 运行期账号对象常驻内存（保证轮询游标与状态实时性），
-每次变更同步落库；进程启动时从 SQLite 读取快照。
+每次变更同步落库；进程启动时从数据库读取快照。
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 import time
-from contextlib import closing
+import urllib.parse
+from contextlib import contextmanager
 
 from . import settings
 from .models import PROVIDERS, Account, Status
 
 _TBL = "accounts"
 _META = "meta"
+
+
+def _detect_backend(url: str) -> str:
+    if not url:
+        return "sqlite"
+    url = url.strip()
+    if url.startswith("postgres://") or url.startswith("postgresql://"):
+        return "pg"
+    if url.startswith("mysql://") or url.startswith("mysql2://"):
+        return "mysql"
+    raise ValueError(f"不支持的 DATABASE_URL 协议: {url}")
+
+
+class DBAdapter:
+    def __init__(self, backend: str, url: str):
+        self.backend = backend
+        self.url = url
+
+        if self.backend == "pg":
+            try:
+                import psycopg
+                from psycopg.rows import dict_row
+                self.psycopg = psycopg
+                self.dict_row = dict_row
+            except ImportError:
+                logging.error("使用 PostgreSQL 需要安装 psycopg。请执行: pip install psycopg[binary]")
+                raise
+        elif self.backend == "mysql":
+            try:
+                import pymysql
+                import pymysql.cursors
+                self.pymysql = pymysql
+                parsed = urllib.parse.urlparse(self.url)
+                self.mysql_kwargs = {
+                    "host": parsed.hostname or "localhost",
+                    "port": parsed.port or 3306,
+                    "user": parsed.username or "root",
+                    "password": parsed.password or "",
+                    "database": parsed.path.lstrip("/"),
+                    "cursorclass": pymysql.cursors.DictCursor,
+                    "autocommit": True
+                }
+            except ImportError:
+                logging.error("使用 MySQL 需要安装 pymysql。请执行: pip install pymysql cryptography")
+                raise
+
+    @contextmanager
+    def get_connection(self):
+        if self.backend == "sqlite":
+            conn = sqlite3.connect(settings.DB_PATH, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            try:
+                yield conn
+            finally:
+                conn.close()
+        elif self.backend == "pg":
+            with self.psycopg.connect(self.url, row_factory=self.dict_row) as conn:
+                yield conn
+        elif self.backend == "mysql":
+            conn = self.pymysql.connect(**self.mysql_kwargs)
+            try:
+                yield conn
+            finally:
+                conn.close()
+
+    def translate_sql(self, sql: str) -> str:
+        """根据后端将 ? 占位符转换为 $1 等（针对 PG）或 %s（针对 MySQL）。"""
+        if self.backend == "sqlite":
+            return sql
+        if self.backend == "mysql":
+            return sql.replace("?", "%s")
+        # For PG: ? -> %s in psycopg 3 with auto mapping (or just keep it as %s)
+        # Psycopg 3 supports %s.
+        return sql.replace("?", "%s")
+
+    def execute_schema(self, conn, sql: str):
+        """执行建表等无参数语句，处理多语句分隔。"""
+        if self.backend == "sqlite":
+            conn.executescript(sql)
+            return
+
+        # PG and MySQL can execute multiple statements separated by semicolon (with some caveats)
+        # We manually split them for safety
+        cursor = conn.cursor()
+        for stmt in sql.split(";"):
+            stmt = stmt.strip()
+            if stmt:
+                cursor.execute(stmt)
+        if self.backend == "pg":
+            conn.commit()
+        cursor.close()
+
+    def execute(self, conn, sql: str, params=()):
+        sql = self.translate_sql(sql)
+        cursor = conn.cursor()
+        cursor.execute(sql, params)
+        if self.backend in ("sqlite", "pg"):
+            conn.commit()
+        return cursor
 
 
 class Store:
@@ -30,23 +134,16 @@ class Store:
         self._accounts: dict[str, list[Account]] = {p: [] for p in PROVIDERS}
         self._settings: dict = {}
         self._rotation: dict[str, int] = {p: 0 for p in PROVIDERS}
+        
+        self.db = DBAdapter(_detect_backend(settings.DATABASE_URL), settings.DATABASE_URL)
+        
         self._init_db()
         self._load()
 
-    # ── SQLite 基础 ──────────────────────────────────────────────────────────
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(settings.DB_PATH, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA busy_timeout=5000")
-        return conn
-
     def _init_db(self) -> None:
-        settings.DATA_DIR.mkdir(parents=True, exist_ok=True)
-        with closing(self._connect()) as conn:
-            conn.executescript(
-                f"""
+        if self.db.backend == "sqlite":
+            settings.DATA_DIR.mkdir(parents=True, exist_ok=True)
+            ddl = f"""
                 CREATE TABLE IF NOT EXISTS {_META} (
                     key   TEXT PRIMARY KEY,
                     value TEXT NOT NULL
@@ -63,33 +160,87 @@ class Store:
                 );
                 CREATE INDEX IF NOT EXISTS idx_acc_provider ON {_TBL} (provider);
                 CREATE INDEX IF NOT EXISTS idx_acc_status   ON {_TBL} (status);
-                """
-            )
-            conn.execute(
-                f"INSERT OR IGNORE INTO {_META} (key, value) VALUES ('admin_key', ?)",
-                (settings.DEFAULT_ADMIN_KEY,),
-            )
-            conn.execute(
-                f"INSERT OR IGNORE INTO {_META} (key, value) VALUES ('gateway_key', '')"
-            )
-            conn.execute(
-                f"INSERT OR IGNORE INTO {_META} (key, value) VALUES ('quota_refresh_interval', ?)",
-                (str(settings.QUOTA_REFRESH_INTERVAL),),
-            )
-            conn.commit()
+            """
+        elif self.db.backend == "pg":
+            ddl = f"""
+                CREATE TABLE IF NOT EXISTS {_META} (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS {_TBL} (
+                    id          TEXT PRIMARY KEY,
+                    provider    TEXT NOT NULL,
+                    name        TEXT,
+                    mode        TEXT,
+                    status      TEXT,
+                    enabled     INTEGER NOT NULL DEFAULT 1,
+                    created_at  DOUBLE PRECISION,
+                    data        TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_acc_provider ON {_TBL} (provider);
+                CREATE INDEX IF NOT EXISTS idx_acc_status   ON {_TBL} (status);
+            """
+        else: # mysql
+            ddl = f"""
+                CREATE TABLE IF NOT EXISTS {_META} (
+                    `key`   VARCHAR(128) PRIMARY KEY,
+                    value   LONGTEXT NOT NULL
+                ) CHARACTER SET utf8mb4;
+                CREATE TABLE IF NOT EXISTS {_TBL} (
+                    id          VARCHAR(128) PRIMARY KEY,
+                    provider    VARCHAR(32) NOT NULL,
+                    name        VARCHAR(255),
+                    mode        VARCHAR(16),
+                    status      VARCHAR(32),
+                    enabled     INT NOT NULL DEFAULT 1,
+                    created_at  DOUBLE,
+                    data        LONGTEXT NOT NULL,
+                    INDEX idx_acc_provider (provider),
+                    INDEX idx_acc_status (status)
+                ) CHARACTER SET utf8mb4;
+            """
+
+        with self.db.get_connection() as conn:
+            try:
+                self.db.execute_schema(conn, ddl)
+            except Exception as e:
+                # 捕获权限不足等错误，给出明确提示
+                err_msg = str(e)
+                if "CREATE command denied" in err_msg or "1142" in err_msg:
+                    logging.error(f"数据库权限不足: 无法自动创建表。请确保你的数据库用户拥有 CREATE 权限，或者手动在数据库中执行建表语句。\n详细错误: {err_msg}")
+                    # 不抛出异常的话后续 SELECT 会报错，所以这里最好还是抛出，但带上清晰的说明
+                    raise RuntimeError(f"数据库权限不足，无法自动创建数据表，请赋予 CREATE 权限或手动建表: {err_msg}") from e
+                raise
+            
+            # 初始化默认配置
+            if self.db.backend == "sqlite":
+                self.db.execute(conn, f"INSERT OR IGNORE INTO {_META} (key, value) VALUES (?, ?)", ('admin_key', settings.DEFAULT_ADMIN_KEY))
+                self.db.execute(conn, f"INSERT OR IGNORE INTO {_META} (key, value) VALUES (?, ?)", ('gateway_key', ''))
+                self.db.execute(conn, f"INSERT OR IGNORE INTO {_META} (key, value) VALUES (?, ?)", ('quota_refresh_interval', str(settings.QUOTA_REFRESH_INTERVAL)))
+            elif self.db.backend == "pg":
+                self.db.execute(conn, f"INSERT INTO {_META} (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING", ('admin_key', settings.DEFAULT_ADMIN_KEY))
+                self.db.execute(conn, f"INSERT INTO {_META} (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING", ('gateway_key', ''))
+                self.db.execute(conn, f"INSERT INTO {_META} (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING", ('quota_refresh_interval', str(settings.QUOTA_REFRESH_INTERVAL)))
+            else: # mysql
+                self.db.execute(conn, f"INSERT IGNORE INTO {_META} (`key`, value) VALUES (?, ?)", ('admin_key', settings.DEFAULT_ADMIN_KEY))
+                self.db.execute(conn, f"INSERT IGNORE INTO {_META} (`key`, value) VALUES (?, ?)", ('gateway_key', ''))
+                self.db.execute(conn, f"INSERT IGNORE INTO {_META} (`key`, value) VALUES (?, ?)", ('quota_refresh_interval', str(settings.QUOTA_REFRESH_INTERVAL)))
+
 
     def _load(self) -> None:
-        with closing(self._connect()) as conn:
-            meta_rows = conn.execute(f"SELECT key, value FROM {_META}").fetchall()
+        with self.db.get_connection() as conn:
+            if self.db.backend == "mysql":
+                meta_rows = self.db.execute(conn, f"SELECT `key`, value FROM {_META}").fetchall()
+            else:
+                meta_rows = self.db.execute(conn, f"SELECT key, value FROM {_META}").fetchall()
+
             self._settings = {r["key"]: r["value"] for r in meta_rows}
             self._settings.setdefault("admin_key", settings.DEFAULT_ADMIN_KEY)
             self._settings.setdefault("gateway_key", "")
             self._settings.setdefault("quota_refresh_interval", str(settings.QUOTA_REFRESH_INTERVAL))
 
             self._accounts = {p: [] for p in PROVIDERS}
-            rows = conn.execute(
-                f"SELECT data FROM {_TBL} ORDER BY created_at ASC"
-            ).fetchall()
+            rows = self.db.execute(conn, f"SELECT data FROM {_TBL} ORDER BY created_at ASC").fetchall()
             for row in rows:
                 try:
                     account = Account.from_dict(json.loads(row["data"]))
@@ -99,31 +250,60 @@ class Store:
                     self._accounts[account.provider].append(account)
 
     def _persist_account(self, account: Account) -> None:
-        with closing(self._connect()) as conn:
-            conn.execute(
-                f"""INSERT OR REPLACE INTO {_TBL}
+        args = (
+            account.id, account.provider, account.name, account.mode,
+            account.status, 1 if account.enabled else 0, account.created_at,
+            json.dumps(account.to_dict(), ensure_ascii=False)
+        )
+        
+        with self.db.get_connection() as conn:
+            if self.db.backend == "sqlite":
+                self.db.execute(conn, f"""
+                    INSERT OR REPLACE INTO {_TBL}
                     (id, provider, name, mode, status, enabled, created_at, data)
-                    VALUES (?,?,?,?,?,?,?,?)""",
-                (
-                    account.id, account.provider, account.name, account.mode,
-                    account.status, 1 if account.enabled else 0, account.created_at,
-                    json.dumps(account.to_dict(), ensure_ascii=False),
-                ),
-            )
-            conn.commit()
+                    VALUES (?,?,?,?,?,?,?,?)
+                """, args)
+            elif self.db.backend == "pg":
+                self.db.execute(conn, f"""
+                    INSERT INTO {_TBL}
+                    (id, provider, name, mode, status, enabled, created_at, data)
+                    VALUES (?,?,?,?,?,?,?,?)
+                    ON CONFLICT (id) DO UPDATE SET
+                        provider = EXCLUDED.provider,
+                        name = EXCLUDED.name,
+                        mode = EXCLUDED.mode,
+                        status = EXCLUDED.status,
+                        enabled = EXCLUDED.enabled,
+                        created_at = EXCLUDED.created_at,
+                        data = EXCLUDED.data
+                """, args)
+            elif self.db.backend == "mysql":
+                self.db.execute(conn, f"""
+                    INSERT INTO {_TBL}
+                    (id, provider, name, mode, status, enabled, created_at, data)
+                    VALUES (?,?,?,?,?,?,?,?)
+                    ON DUPLICATE KEY UPDATE
+                        provider = VALUES(provider),
+                        name = VALUES(name),
+                        mode = VALUES(mode),
+                        status = VALUES(status),
+                        enabled = VALUES(enabled),
+                        created_at = VALUES(created_at),
+                        data = VALUES(data)
+                """, args)
 
     def _delete_account(self, account_id: str) -> None:
-        with closing(self._connect()) as conn:
-            conn.execute(f"DELETE FROM {_TBL} WHERE id = ?", (account_id,))
-            conn.commit()
+        with self.db.get_connection() as conn:
+            self.db.execute(conn, f"DELETE FROM {_TBL} WHERE id = ?", (account_id,))
 
     def _set_meta(self, key: str, value: str) -> None:
-        with closing(self._connect()) as conn:
-            conn.execute(
-                f"INSERT OR REPLACE INTO {_META} (key, value) VALUES (?, ?)",
-                (key, value),
-            )
-            conn.commit()
+        with self.db.get_connection() as conn:
+            if self.db.backend == "sqlite":
+                self.db.execute(conn, f"INSERT OR REPLACE INTO {_META} (key, value) VALUES (?, ?)", (key, value))
+            elif self.db.backend == "pg":
+                self.db.execute(conn, f"INSERT INTO {_META} (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", (key, value))
+            else:
+                self.db.execute(conn, f"INSERT INTO {_META} (`key`, value) VALUES (?, ?) ON DUPLICATE KEY UPDATE value = VALUES(value)", (key, value))
 
     def save(self) -> None:
         """全量落库（兜底接口）。"""

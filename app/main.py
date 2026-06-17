@@ -12,7 +12,7 @@ from . import settings
 from . import logs
 from .captcha import captcha_manager
 from .quota import monitor
-from .routes import admin_api, captcha_routes, gateway, pages
+from .routes import admin_api, gateway, pages
 
 # 修正 Windows 中文控制台可能出现的乱码
 for _stream in (sys.stdout, sys.stderr):
@@ -49,7 +49,6 @@ def create_app() -> FastAPI:
 
     app.mount("/static", StaticFiles(directory=str(settings.STATIC_DIR)), name="static")
 
-    app.include_router(captcha_routes.router)
     app.include_router(pages.router)
     app.include_router(admin_api.router)
     app.include_router(gateway.router)

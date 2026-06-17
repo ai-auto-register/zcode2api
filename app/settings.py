@@ -35,6 +35,7 @@ def _int(env_name: str, default: int) -> int:
 DATA_DIR = _resolve_path("ZCODE_DATA_DIR", "data")
 # 账号与设置持久化到本地 SQLite（与 grok2api 的 local 后端一致）
 DB_PATH = DATA_DIR / "accounts.db"
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 STATIC_DIR = Path(__file__).resolve().parent / "statics"
 
 # ── 服务 ─────────────────────────────────────────────────────────────────────
@@ -49,8 +50,12 @@ DEFAULT_ADMIN_KEY = os.getenv("ZCODE_ADMIN_KEY", "zcode")
 CAPTCHA_CACHE_TTL = _int("CAPTCHA_CACHE_TTL", 45_000)          # ms
 CAPTCHA_CONFIG_CACHE_TTL = _int("CAPTCHA_CONFIG_CACHE_TTL", 600_000)  # ms
 
-# 验证码求解超时（WS 等待客户端响应）
-CAPTCHA_SOLVE_TIMEOUT = _int("ZCODE_CAPTCHA_TIMEOUT", 60)
+# 验证码求解（无浏览器：Node + jsdom 模拟浏览器环境，运行阿里云无痕 SDK）
+NODE_PATH = os.getenv("ZCODE_NODE_PATH", "node")
+CAPTCHA_SOLVER_DIR = ROOT_DIR / "captcha_node"
+CAPTCHA_SOLVER_JS = CAPTCHA_SOLVER_DIR / "solver.js"
+CAPTCHA_SOLVE_RETRIES = _int("ZCODE_CAPTCHA_RETRIES", 4)
+CAPTCHA_SOLVE_TIMEOUT = _int("ZCODE_CAPTCHA_TIMEOUT", 40)  # 每次求解超时（秒）
 
 # ── 用量监控 ─────────────────────────────────────────────────────────────────
 # 后台自动刷新账号额度的间隔（秒）。0 表示关闭后台轮询，仅按需刷新。

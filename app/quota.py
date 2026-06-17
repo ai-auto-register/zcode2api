@@ -58,7 +58,10 @@ async def fetch_quota(account: Account) -> dict:
             store.update_account(account)
             return {"error": account.last_error}
 
+    has_data = False
+    
     if billing_res is not None and billing_res.status_code == 200:
+        has_data = True
         try:
             data = billing_res.json()
             result["billing"] = data
@@ -69,6 +72,7 @@ async def fetch_quota(account: Account) -> dict:
 
     quota_map: dict = {}
     if balance_res is not None and balance_res.status_code == 200:
+        has_data = True
         try:
             data = balance_res.json()
             result["balance"] = data
@@ -84,6 +88,7 @@ async def fetch_quota(account: Account) -> dict:
             pass
 
     if usage_res is not None and usage_res.status_code == 200:
+        has_data = True
         try:
             account.usage = usage_res.json().get("data") or {}
             result["usage"] = account.usage
@@ -104,8 +109,15 @@ async def fetch_quota(account: Account) -> dict:
             account.status = Status.ACTIVE
             account.last_error = None
             account.cooling_until = None
+    elif has_data:
+        # 接口 200，但就是没有任何额度数据（新号/未领免费额度）
+        account.quota = {}
+        account.status = Status.EXHAUSTED
+        account.last_error = "当前账号未开通套餐或未分配额度"
 
     store.update_account(account)
+    if has_data:
+        return result
     return result or {"error": "无法获取额度数据"}
 
 

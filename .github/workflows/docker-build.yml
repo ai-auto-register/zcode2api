@@ -5,15 +5,17 @@ name: docker-build
 
 on:
   push:
-    branches: [master]
+    branches: [main, master]
     tags: ["v*"]
   pull_request:
-    branches: [master]
+    branches: [main, master]
   workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}   # yuanhhs/zcode2api
+  # GitHub 仓库名 (-12358-) 开头和结尾是横杠，不符合 Docker 镜像命名规范，会导致打标签失败
+  # 所以这里我们固定使用 repository_owner/zcode2api 作为镜像名
+  IMAGE_NAME: ${{ github.repository_owner }}/zcode2api
 
 jobs:
   build:

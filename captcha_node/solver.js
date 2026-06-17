@@ -2,6 +2,7 @@ const { JSDOM, VirtualConsole } = require('jsdom');
 const SCENE = process.argv[2] || '11xygtvd';
 const REGION = process.argv[3] || 'sgp';
 const PREFIX = process.argv[4] || 'no8xfe';
+const REVERSE_URL = process.argv[5] || '';
 
 const vc = new VirtualConsole();  // 静默 jsdom 噪声
 const html = `<!DOCTYPE html><html><head></head><body>
@@ -28,6 +29,25 @@ const dom = new JSDOM(html, {
     // Worker 桩
     window.Worker = class { constructor(){} postMessage(){} terminate(){} addEventListener(){} removeEventListener(){} onmessage=null; onerror=null; };
     window.OffscreenCanvas = window.OffscreenCanvas || class { constructor(w,h){this.width=w;this.height=h;} getContext(){return proto.getContext.call(this);} };
+    // 反向代理拦截：把阿里云验证 API 的请求全部走 REVERSE_URL 前缀
+    if (REVERSE_URL) {
+      const _origFetch = window.fetch;
+      window.fetch = function(url, init) {
+        if (typeof url === 'string' && url.indexOf(REVERSE_URL) !== 0) {
+          url = REVERSE_URL + url;
+        }
+        return _origFetch.call(this, url, init);
+      };
+      const _OrigXHR = window.XMLHttpRequest;
+      window.XMLHttpRequest = class extends _OrigXHR {
+        open(method, url, ...rest) {
+          if (typeof url === 'string' && url.indexOf(REVERSE_URL) !== 0) {
+            url = REVERSE_URL + url;
+          }
+          return super.open(method, url, ...rest);
+        }
+      };
+    }
   },
 });
 const { window } = dom;

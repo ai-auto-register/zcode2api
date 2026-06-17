@@ -50,6 +50,9 @@ DEFAULT_ADMIN_KEY = os.getenv("ZCODE_ADMIN_KEY", "zcode")
 CAPTCHA_CACHE_TTL = _int("CAPTCHA_CACHE_TTL", 45_000)          # ms
 CAPTCHA_CONFIG_CACHE_TTL = _int("CAPTCHA_CONFIG_CACHE_TTL", 600_000)  # ms
 
+# 阿里云无痕验证反向代理前缀（留空则直连阿里云）
+REVERSE_URL = os.getenv("REVERSE_URL", "").strip().rstrip("/")
+
 # 验证码求解（无浏览器：Node + jsdom 模拟浏览器环境，运行阿里云无痕 SDK）
 NODE_PATH = os.getenv("ZCODE_NODE_PATH", "node")
 CAPTCHA_SOLVER_DIR = ROOT_DIR / "captcha_node"

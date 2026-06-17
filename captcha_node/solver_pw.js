@@ -7,6 +7,7 @@ const http = require('http');
 const SCENE  = process.argv[2] || '11xygtvd';
 const REGION = process.argv[3] || 'sgp';
 const PREFIX = process.argv[4] || 'no8xfe';
+const REVERSE_URL = process.argv[5] || '';
 const HEADLESS = process.env.HEADLESS === '1';
 
 const HTML = `<!DOCTYPE html><html><head><meta charset="utf-8">
@@ -52,8 +53,27 @@ window.addEventListener('DOMContentLoaded', boot);
 
   const ctx = await browser.newContext({ locale: 'zh-CN' });
   const page = await ctx.newPage();
-  // 去掉 navigator.webdriver
   await page.addInitScript(() => { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); });
+  if (REVERSE_URL) {
+    await page.addInitScript((rev) => {
+      const _origFetch = window.fetch;
+      window.fetch = function(url, init) {
+        if (typeof url === 'string' && url.indexOf(rev) !== 0) {
+          url = rev + url;
+        }
+        return _origFetch.call(this, url, init);
+      };
+      const _OrigXHR = window.XMLHttpRequest;
+      window.XMLHttpRequest = class extends _OrigXHR {
+        open(method, url, ...rest) {
+          if (typeof url === 'string' && url.indexOf(rev) !== 0) {
+            url = rev + url;
+          }
+          return super.open(method, url, ...rest);
+        }
+      };
+    }, REVERSE_URL);
+  }
 
   const got = new Promise((resolve) => { page.exposeFunction('__submitParam', (p) => resolve(p)); });
 

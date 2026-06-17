@@ -90,7 +90,8 @@ class CaptchaManager:
                 f"未找到求解器 {settings.CAPTCHA_SOLVER_JS}，请先在 captcha_node 下执行 npm install"
             )
         proc = await asyncio.create_subprocess_exec(
-            settings.NODE_PATH, str(settings.CAPTCHA_SOLVER_JS), scene, region, prefix,
+            settings.NODE_PATH, str(settings.CAPTCHA_SOLVER_JS),
+            scene, region, prefix, settings.REVERSE_URL,
             cwd=str(settings.CAPTCHA_SOLVER_DIR),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,

@@ -27,19 +27,30 @@ async def verify():
 
 # ── 账号列表 + 概览统计 ──────────────────────────────────────────────────────
 @router.get("/accounts")
-async def list_accounts():
+async def list_accounts(page: int = 1, page_size: int = 20, status: str = "all"):
     now = time.time()
-    accounts = [a.public_view() for a in store.list_accounts()]
-    stats = {"total": len(accounts), "active": 0, "exhausted": 0,
+    all_accounts = store.list_accounts()
+    all_views = [a.public_view() for a in all_accounts]
+    stats = {"total": len(all_views), "active": 0, "exhausted": 0,
              "cooling": 0, "invalid": 0, "disabled": 0,
-             "calls": 0, "fail": 0}
-    for a in accounts:
+             "calls": 0, "fail": 0, "total_quota_remaining": 0}
+    for a in all_views:
         st = a["status"]
         if st in stats:
             stats[st] += 1
         stats["calls"] += a["use_count"]
         stats["fail"] += a["fail_count"]
-    return {"accounts": accounts, "stats": stats, "providers": list(PROVIDERS), "ts": now}
+        q = a.get("quota", {})
+        for w in q.values():
+            stats["total_quota_remaining"] += int(w.get("remaining", 0) or 0)
+    if status != "all":
+        all_views = [a for a in all_views if a["status"] == status]
+    total = len(all_views)
+    start = (page - 1) * page_size
+    paged = all_views[start:start + page_size]
+    return {"accounts": paged, "stats": stats, "total": total,
+            "page": page, "page_size": page_size,
+            "providers": list(PROVIDERS), "ts": now}
 
 
 @router.get("/status")

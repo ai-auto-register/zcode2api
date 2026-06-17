@@ -67,6 +67,7 @@
       <tbody id="tbody"></tbody>
     </table>
   </div>
+  <div class="pagination" id="pagination"></div>
 </main>
 
 <!-- Add modal -->
@@ -153,7 +154,7 @@
 <script src="/static/js/toast.js?v={{APP_VERSION}}"></script>
 <script src="/static/js/header.js?v={{APP_VERSION}}"></script>
 <script>
-let allAccounts=[], curFilter='all', _cb=null, _editId='', _timer=null;
+let allAccounts=[], curFilter='all', _cb=null, _editId='', _timer=null, curPage=1, pageSize=20, totalCount=0;
 const refreshing=new Set();
 
 const STATUS_LABEL={active:'正常',exhausted:'用完',cooling:'限流',invalid:'异常',disabled:'禁用'};
@@ -174,11 +175,13 @@ function anyModalOpen(){return!!document.querySelector('.modal-overlay.open');}
 
 async function load(silent){
   try{
-    const d=await api('GET','/accounts');
+    const d=await api('GET','/accounts?page='+curPage+'&page_size='+pageSize+'&status='+curFilter);
     allAccounts=d.accounts||[];
+    totalCount=d.total||0;
     renderStats(d.stats||{});
-    renderFilters();
+    renderFilters(d.stats||{});
     renderTable();
+    renderPagination();
     document.getElementById('last-updated').textContent='更新于 '+new Date().toLocaleTimeString();
   }catch(e){ if(!silent)showToast('加载失败: '+e.message,'error'); }
 }
@@ -187,27 +190,67 @@ function renderStats(s){
   set('s-total',s.total||0);
   set('s-active',s.active||0);
   set('s-exhausted',s.exhausted||0);
-  let totalRem=0;
-  allAccounts.forEach(a=>{const q=a.quota||{};Object.values(q).forEach(w=>{totalRem+=Number(w.remaining)||0;});});
-  set('s-quota',fmt(totalRem));
+  set('s-quota',fmt(s.total_quota_remaining||0));
 }
 
-function renderFilters(){
-  const counts={all:allAccounts.length,exhausted:0,disabled:0};
-  allAccounts.forEach(a=>{counts[a.status]=(counts[a.status]||0)+1;});
+function renderFilters(s){
+  s=s||{};
+  const counts={all:s.total||0,exhausted:s.exhausted||0,disabled:s.disabled||0};
   const chips=[['all','全部'],['exhausted','用完'],['disabled','禁用']];
   document.getElementById('filter-bar').innerHTML=chips.map(([k,l])=>
     `<button class="filter-chip${curFilter===k?' active':''}" onclick="setFilter('${k}')">${l}<span class="filter-chip-count">${counts[k]||0}</span></button>`
   ).join('');
 }
-function setFilter(k){curFilter=k;renderFilters();renderTable();}
+function setFilter(k){curFilter=k;curPage=1;load();}
 
 function renderTable(){
-  const items=curFilter==='all'?allAccounts:allAccounts.filter(a=>a.status===curFilter);
-  document.getElementById('tbl-count').textContent=items.length;
+  document.getElementById('tbl-count').textContent=totalCount;
   const tb=document.getElementById('tbody');
-  if(!items.length){tb.innerHTML='<tr><td colspan="9" class="empty-state">暂无账号，点击右上角「新增」添加</td></tr>';return;}
-  tb.innerHTML=items.map(rowHtml).join('');
+  if(!allAccounts.length){tb.innerHTML='<tr><td colspan="9" class="empty-state">暂无账号，点击右上角「新增」添加</td></tr>';return;}
+  tb.innerHTML=allAccounts.map(rowHtml).join('');
+}
+function renderPagination(){
+  const el=document.getElementById('pagination');
+  if(!el)return;
+  const totalPages=Math.ceil(totalCount/pageSize)||1;
+  if(curPage>totalPages)curPage=totalPages;
+  if(totalCount<=0){el.innerHTML='';return;}
+  const sizeOpts=[10,20,50,100];
+  const start=(curPage-1)*pageSize+1;
+  const end=Math.min(curPage*pageSize,totalCount);
+  let html=`<div class="pagination-info">${start}-${end} / 共 ${totalCount} 条</div>`;
+  html+='<div class="pagination-controls">';
+  html+=`<button class="pagination-btn" onclick="goPage(${curPage-1})"${curPage<=1?' disabled':''}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m15 18-6-6 6-6"/></svg></button>`;
+  const pages=getPageNumbers(curPage,totalPages);
+  for(const p of pages){
+    if(p==='...'){html+='<span style="padding:0 4px;color:#ccc;font-size:12px">…</span>';continue;}
+    html+=`<button class="pagination-btn${p===curPage?' active':''}" onclick="goPage(${p})">${p}</button>`;
+  }
+  html+=`<button class="pagination-btn" onclick="goPage(${curPage+1})"${curPage>=totalPages?' disabled':''}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg></button>`;
+  html+='</div>';
+  html+=`<select class="pagination-size" onchange="changePageSize(this.value)">${sizeOpts.map(s=>`<option value="${s}"${s===pageSize?' selected':''}>${s} 条/页</option>`).join('')}</select>`;
+  el.innerHTML=html;
+}
+function getPageNumbers(current,total){
+  if(total<=7)return Array.from({length:total},(_,i)=>i+1);
+  const pages=[1];
+  if(current>3)pages.push('...');
+  const start=Math.max(2,current-1);
+  const end=Math.min(total-1,current+1);
+  for(let i=start;i<=end;i++)pages.push(i);
+  if(current<total-2)pages.push('...');
+  pages.push(total);
+  return pages;
+}
+function goPage(p){
+  const totalPages=Math.ceil(totalCount/pageSize)||1;
+  if(p<1||p>totalPages)return;
+  curPage=p;load();
+}
+function changePageSize(size){
+  pageSize=parseInt(size)||20;
+  curPage=1;
+  load();
 }
 
 function rowHtml(a){

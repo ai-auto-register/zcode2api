@@ -8,7 +8,7 @@ const SCENE  = process.argv[2] || '11xygtvd';
 const REGION = process.argv[3] || 'sgp';
 const PREFIX = process.argv[4] || 'no8xfe';
 const REVERSE_URL = process.argv[5] || '';
-const HEADLESS = process.env.HEADLESS === '1';
+const HEADLESS = process.env.HEADLESS === '0';
 
 const HTML = `<!DOCTYPE html><html><head><meta charset="utf-8">
 <script src="https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js"></script>

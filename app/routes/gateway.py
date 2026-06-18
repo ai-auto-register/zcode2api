@@ -159,12 +159,16 @@ _NEXT_ACCOUNT = object()
 async def _try_account(req_id: str, account: Account, body: dict, incoming_headers: dict, port: int, formatter: Callable):
     needs_captcha = account.provider == "zai" and account.mode == "jwt"
     payload = json.dumps(body).encode("utf-8")
+    payload_size = len(payload)
+
+    logs.info("gateway", f"[{req_id}] 开始尝试账号 {account.name} (模式={account.mode}, provider={account.provider})")
 
     for attempt in range(MAX_CAPTCHA_RETRIES):
         verify_param = None
         if needs_captcha:
             try:
                 verify_param = await captcha_manager.get_verify_param(port)
+                logs.info("gateway", f"[{req_id}] 验证码参数已获取 (attempt {attempt + 1})")
             except Exception as err:
                 logs.req_err(req_id, f"人机校验失败: {err}")
                 return JSONResponse({"error": {"message": f"无法完成人机校验: {err}", "type": "captcha_error"}}, status_code=500)
@@ -176,22 +180,31 @@ async def _try_account(req_id: str, account: Account, body: dict, incoming_heade
             logs.warn(req_id, f"账号 {account.name} 凭证无效，切换下一个")
             return _NEXT_ACCOUNT
 
+        logs.info("gateway", f"[{req_id}] POST {url} (payload={payload_size} bytes, attempt={attempt + 1})")
+        t0 = time.time()
+
         client = httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=None, write=120.0, pool=30.0))
         cm = client.stream("POST", url, headers=headers, content=payload)
         try:
             resp = await cm.__aenter__()
         except httpx.HTTPError as err:
+            elapsed = time.time() - t0
             await client.aclose()
             _mark(account, Status.COOLING, f"连接失败: {err}")
-            logs.warn(req_id, f"账号 {account.name} 连接失败，切换下一个")
+            logs.warn(req_id, f"账号 {account.name} 连接失败 ({elapsed:.1f}s): {err}")
             return _NEXT_ACCOUNT
 
         status_code = resp.status_code
+        elapsed = time.time() - t0
+        logs.info("gateway", f"[{req_id}] ← HTTP {status_code} ({elapsed:.1f}s)")
 
         if status_code >= 400:
             text = (await resp.aread()).decode("utf-8", "ignore")
             await cm.__aexit__(None, None, None)
             await client.aclose()
+
+            err_preview = text[:200]
+            logs.info("gateway", f"[{req_id}] 错误响应: HTTP {status_code} body={err_preview}")
 
             if status_code == 403 and _is_captcha_error(text) and needs_captcha:
                 captcha_manager.invalidate()
@@ -228,10 +241,11 @@ async def _try_account(req_id: str, account: Account, body: dict, incoming_heade
         account.last_used_at = time.time()
         if account.status in (Status.COOLING, Status.EXHAUSTED):
             account.status = Status.ACTIVE
+            logs.info("gateway", f"[{req_id}] 账号 {account.name} 状态恢复为 ACTIVE")
         store.update_account(account)
         asyncio.create_task(_safe_refresh(account))
 
-        # 调用 formatter，formatter 负责消费 resp 和清理 client
+        logs.info("gateway", f"[{req_id}] 账号 {account.name} 请求成功，开始透传响应")
         return await formatter(resp, cm, client, req_id, body)
 
     logs.warn(req_id, f"账号 {account.name} 验证码连续失败，切换下一个")
@@ -246,18 +260,22 @@ async def run_with_rotation(req: Request, provider: str, body: dict, formatter: 
     port = req.url.port or settings.PORT
     tried: set[str] = set()
 
-    for _ in range(MAX_ACCOUNT_ATTEMPTS):
+    for attempt_idx in range(MAX_ACCOUNT_ATTEMPTS):
         account = store.select(provider, skip_ids=tried)
         if account is None:
+            logs.warn(req_id, f"provider={provider} 无更多可用账号 (已尝试 {len(tried)} 个)")
             break
         tried.add(account.id)
 
+        logs.info("gateway", f"[{req_id}] 第 {attempt_idx + 1} 次尝试: 账号 {account.name} (id={account.id})")
         result = await _try_account(req_id, account, body, incoming_headers, port, formatter)
         if result is _NEXT_ACCOUNT:
+            logs.info("gateway", f"[{req_id}] 账号 {account.name} 不可用，继续尝试下一个")
             continue
         return result
 
-    logs.req_err(req_id, "无可用账号 / 额度均已耗尽")
+    tried_str = ", ".join(tried) if tried else "无"
+    logs.req_err(req_id, f"无可用账号 / 额度均已耗尽 (已尝试: {tried_str})")
     return JSONResponse(
         {"error": {"message": "所有账号均不可用或额度已用完，请在后台检查账号状态", "type": "no_available_account"}},
         status_code=503,

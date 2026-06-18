@@ -33,16 +33,11 @@ async def fetch_quota(account: Account) -> dict:
     base = settings.ZCODE_BILLING_BASE
     result: dict = {}
 
-    logs.info("quota", f"查询账号 {account.name} (mode={account.mode}) 额度: {base}/billing/current, balance, usage")
-
     async with httpx.AsyncClient(timeout=20) as client:
         async def _get(path: str):
             try:
-                res = await client.get(f"{base}{path}", headers=headers)
-                logs.info("quota", f"  GET {path} → HTTP {res.status_code} ({len(res.content)} bytes)")
-                return res
-            except httpx.HTTPError as e:
-                logs.warn("quota", f"  GET {path} 请求失败: {e}")
+                return await client.get(f"{base}{path}", headers=headers)
+            except httpx.HTTPError:
                 return None
 
         billing_res, balance_res, usage_res = await asyncio.gather(
@@ -61,7 +56,6 @@ async def fetch_quota(account: Account) -> dict:
             account.status = Status.INVALID
             account.last_error = f"鉴权失败 HTTP {billing_res.status_code}"
             store.update_account(account)
-            logs.warn("quota", f"账号 {account.name} 鉴权失败 HTTP {billing_res.status_code} → INVALID")
             return {"error": account.last_error}
 
     has_data = False
@@ -73,8 +67,6 @@ async def fetch_quota(account: Account) -> dict:
             result["billing"] = data
             plans = (data.get("data") or {}).get("plans") or []
             account.plan = plans[0] if plans else {}
-            if plans:
-                logs.info("quota", f"  方案: {plans[0].get('plan_name') or plans[0].get('name', '?')}")
         except (ValueError, KeyError):
             pass
 
@@ -86,15 +78,12 @@ async def fetch_quota(account: Account) -> dict:
             result["balance"] = data
             for bal in (data.get("data") or {}).get("balances") or []:
                 name = bal.get("show_name") or bal.get("model") or "model"
-                remaining = bal.get("remaining_units")
-                total = bal.get("total_units")
                 quota_map[name] = {
-                    "total": total,
+                    "total": bal.get("total_units"),
                     "used": bal.get("used_units"),
-                    "remaining": remaining,
+                    "remaining": bal.get("remaining_units"),
                     "expires_at": bal.get("expires_at"),
                 }
-                logs.info("quota", f"  额度 {name}: {remaining}/{total}")
         except (ValueError, KeyError):
             pass
 
@@ -103,7 +92,6 @@ async def fetch_quota(account: Account) -> dict:
         try:
             account.usage = usage_res.json().get("data") or {}
             result["usage"] = account.usage
-            logs.info("quota", f"  用量数据已更新")
         except (ValueError, KeyError):
             pass
 
@@ -115,23 +103,18 @@ async def fetch_quota(account: Account) -> dict:
         if remainings and all((r or 0) <= 0 for r in remainings):
             account.status = Status.EXHAUSTED
             account.last_error = "额度已用完"
-            logs.warn("quota", f"账号 {account.name} 所有模型额度均耗尽 → EXHAUSTED")
         elif account.status in (Status.EXHAUSTED, Status.COOLING, Status.INVALID):
             account.status = Status.ACTIVE
             account.last_error = None
             account.cooling_until = None
-            logs.info("quota", f"账号 {account.name} 额度恢复 → ACTIVE")
     elif has_data:
         account.quota = {}
         account.status = Status.EXHAUSTED
         account.last_error = "当前账号未开通套餐或未分配额度"
-        logs.warn("quota", f"账号 {account.name} 无额度数据 → EXHAUSTED")
 
     store.update_account(account)
     if has_data:
-        logs.info("quota", f"账号 {account.name} 额度查询完成 → status={account.status}")
         return result
-    logs.warn("quota", f"账号 {account.name} 额度查询失败，无可用数据")
     return result or {"error": "无法获取额度数据"}
 
 
@@ -148,9 +131,7 @@ async def refresh_accounts(accounts: list[Account]) -> dict:
 
     results = await asyncio.gather(*[_one(a) for a in accounts], return_exceptions=True)
     ok = sum(1 for r in results if r is True)
-    fail = len(accounts) - ok
-    logs.info("quota", f"批量刷新完成: {ok} 成功, {fail} 失败 (共 {len(accounts)} 个)")
-    return {"ok": ok, "fail": fail}
+    return {"ok": ok, "fail": len(accounts) - ok}
 
 
 class QuotaMonitor:

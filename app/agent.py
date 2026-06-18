@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from . import logs, settings
+from . import settings
 from .models import Account
 
 # 透传客户端 header 时需要剔除的字段
@@ -65,5 +65,4 @@ def build_request(
             continue
         headers[key] = value
 
-    logs.info("agent", f"[{account.name}] → {target_url} (mode={account.mode}, provider={provider})")
     return target_url, headers

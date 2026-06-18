@@ -1,3 +1,5 @@
+require('global-agent/bootstrap');
+
 const { JSDOM, VirtualConsole } = require('jsdom');
 const SCENE = process.argv[2] || '11xygtvd';
 const REGION = process.argv[3] || 'sgp';

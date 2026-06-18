@@ -331,7 +331,7 @@ async def chat_completions(request: Request):
 
 async def _safe_refresh(account: Account) -> None:
     try:
-        if account.provider == "zai" and account.mode == "jwt":
+        if account.provider == "zai":
             await fetch_quota(account)
     except Exception:
         pass

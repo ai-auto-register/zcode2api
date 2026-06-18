@@ -158,7 +158,7 @@ class QuotaMonitor:
                 try:
                     accounts = [
                         a for a in store.list_accounts("zai")
-                        if a.mode == "jwt" and a.status != Status.DISABLED
+                        if a.status != Status.DISABLED
                     ]
                     if accounts:
                         await refresh_accounts(accounts)

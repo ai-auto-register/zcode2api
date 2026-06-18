@@ -89,12 +89,20 @@ class CaptchaManager:
             raise RuntimeError(
                 f"未找到求解器 {settings.CAPTCHA_SOLVER_JS}，请先在 captcha_node 下执行 npm install"
             )
+        env = None
+        if settings.PROXY_URL:
+            env = {"GLOBAL_AGENT_HTTP_PROXY": settings.PROXY_URL, **dict(env or {})}
+            # 继承父进程 PATH 确保能找到 node
+            import os
+            if os.environ.get("PATH"):
+                env["PATH"] = os.environ["PATH"]
         proc = await asyncio.create_subprocess_exec(
             settings.NODE_PATH, str(settings.CAPTCHA_SOLVER_JS),
             scene, region, prefix, settings.REVERSE_URL,
             cwd=str(settings.CAPTCHA_SOLVER_DIR),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
+            env=env,
         )
         try:
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=settings.CAPTCHA_SOLVE_TIMEOUT)

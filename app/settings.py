@@ -66,6 +66,10 @@ QUOTA_REFRESH_INTERVAL = _int("ZCODE_QUOTA_REFRESH_INTERVAL", 60)
 # 限流（cooling）冷却时长（秒）
 COOLING_SECONDS = _int("ZCODE_COOLING_SECONDS", 300)
 
+# ── 代理 ─────────────────────────────────────────────────────────────────────
+# Node 验证码求解器的 HTTP(S) 代理
+PROXY_URL = os.getenv("PROXY_URL", "").strip()
+
 # ── 上游端点 ─────────────────────────────────────────────────────────────────
 UPSTREAM = {
     "zai": os.getenv(

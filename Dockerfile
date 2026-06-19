@@ -39,6 +39,9 @@ COPY . .
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev
 
+# ── Camoufox 浏览器二进制（camoufox 求解器需要，约 ~300MB）────────────────────
+RUN camoufox fetch
+
 # 账号 / 设置持久化目录（建议挂载到宿主机卷）
 VOLUME ["/data"]
 EXPOSE 3000

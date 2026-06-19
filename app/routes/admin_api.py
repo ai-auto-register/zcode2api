@@ -8,6 +8,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 from fastapi.responses import JSONResponse
 
 from ..auth_admin import verify_admin_key
+from ..captcha import captcha_manager
 from ..models import PROVIDERS, Status
 from ..oauth import ZaiAuthFlow
 from ..quota import fetch_quota, refresh_accounts
@@ -251,3 +252,20 @@ async def export_accounts():
 async def import_accounts(payload: dict = Body(...)):
     count = store.import_accounts(payload)
     return {"count": count}
+
+
+# ── 验证码求解测试 ───────────────────────────────────────────────────────────
+@router.post("/solve-test")
+async def solve_test():
+    """手动触发一次验证码求解，返回 verifyParam。"""
+    t0 = time.time()
+    try:
+        param = await captcha_manager.get_verify_param(force_fresh=True)
+        elapsed = time.time() - t0
+        return {"ok": True, "param": param, "length": len(param), "elapsed": round(elapsed, 2)}
+    except Exception as err:  # noqa: BLE001
+        elapsed = time.time() - t0
+        return JSONResponse(
+            {"ok": False, "error": str(err), "elapsed": round(elapsed, 2)},
+            status_code=502,
+        )

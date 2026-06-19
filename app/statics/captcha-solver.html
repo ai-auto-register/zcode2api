@@ -1,0 +1,188 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>Captcha Solver</title>
+<style>
+  .captcha-hidden { position: fixed; left: 0; top: 0; z-index: 2147483647; width: 300px; height: 200px; overflow: visible; pointer-events: none; }
+  .captcha-hidden > div { position: absolute; left: 0; top: 0; width: 300px; height: 200px; overflow: visible; }
+  #captcha-btn { position: fixed; left: 50%; top: 50%; width: 10px; height: 10px; border: 0; padding: 0; opacity: 0.01; }
+</style>
+<script>
+// 所有变量和函数声明放在最前面，确保 onSdkLoad 回调时可用
+window.sdkLoadTime = 0;
+window.captchaInstance = null;
+window.captchaInstancePromise = null;
+window.pendingResolve = null;
+window.pendingReject = null;
+window.CONFIG_URL = 'https://zcode.z.ai/api/v1/client/configs?app_version=3.0.0&platform=win32';
+window.INSTANCE_TIMEOUT_MS = 10000;
+window.MIN_INTERVAL_MS = 2000;
+
+function log(msg) { console.log('[solver] ' + msg); }
+
+function onSdkLoad() {
+  window.sdkLoadTime = Date.now();
+  window.__sdkReady = true;
+  log('SDK loaded, initAliyunCaptcha=' + (typeof window.initAliyunCaptcha === 'function'));
+}
+
+function extractCaptchaVerifyParam(data) {
+  if (typeof data === 'object' && data !== null) {
+    var val = (typeof data.captchaVerifyParam === 'string' ? data.captchaVerifyParam
+      : typeof data.CaptchaVerifyParam === 'string' ? data.CaptchaVerifyParam : undefined);
+    return val ? val.trim() : undefined;
+  }
+  return undefined;
+}
+
+function isTerminalPass(data) {
+  if (typeof data !== 'object' || !data) return false;
+  var vc = typeof data.verifyCode === 'string' ? data.verifyCode
+    : typeof data.VerifyCode === 'string' ? data.VerifyCode : undefined;
+  return (data.success === true && data.verifyResult === true) || vc === 'T006';
+}
+
+async function fetchCaptchaConfig() {
+  log('Fetching config...');
+  var resp = await fetch(CONFIG_URL);
+  var json = await resp.json();
+  if (json.code !== 0 || !json.data || !json.data.configs || !json.data.configs.captcha) {
+    throw new Error('Invalid config response: code=' + json.code);
+  }
+  var c = json.data.configs.captcha;
+  if (!c.enabled) throw new Error('Captcha disabled');
+  window.__captchaConfig = c;
+  log('Config: region=' + c.region + ' prefix=' + c.prefix + ' sceneId=' + c.sceneId);
+  return c;
+}
+
+async function waitForInstance(promise, timeoutMs) {
+  return Promise.race([
+    promise,
+    new Promise(function(_, rej) { setTimeout(function() { rej(new Error('Instance timed out after ' + timeoutMs + 'ms')); }, timeoutMs); })
+  ]);
+}
+
+async function ensureMinInterval() {
+  if (!window.sdkLoadTime) return;
+  var elapsed = Date.now() - window.sdkLoadTime;
+  if (elapsed >= window.MIN_INTERVAL_MS) return;
+  await new Promise(function(r) { setTimeout(r, window.MIN_INTERVAL_MS - elapsed); });
+}
+
+async function initCaptchaInstance(config) {
+  var initFn = window.initAliyunCaptcha;
+  if (typeof initFn !== 'function') throw new Error('Captcha SDK unavailable');
+  if (window.captchaInstance && window.captchaInstance.configKey === config.configKey) return window.captchaInstance;
+
+  var res, rej;
+  window.captchaInstancePromise = new Promise(function(a, b) { res = a; rej = b; });
+  window.AliyunCaptchaConfig = { region: config.region, prefix: config.prefix };
+
+  try {
+    log('initAliyunCaptcha: sceneId=' + config.sceneId);
+    initFn({
+      SceneId: config.sceneId,
+      mode: 'popup',
+      captchaLogoImg: undefined,
+      showErrorTip: false,
+      element: '#captcha-mount',
+      button: '#captcha-btn',
+      getInstance: function(inst) { log('instance ready'); res(inst); },
+      success: function(param) {
+        log('success, param length=' + param.length);
+        if (window.pendingResolve) { var r = window.pendingResolve; window.pendingResolve = null; window.pendingReject = null; r(param); }
+      },
+      fail: function(err) {
+        log('fail: ' + JSON.stringify(err));
+        var param = extractCaptchaVerifyParam(err);
+        if (isTerminalPass(err) && param) {
+          log('terminal pass from fail');
+          if (window.pendingResolve) { var r = window.pendingResolve; window.pendingResolve = null; window.pendingReject = null; r(param); return; }
+        }
+        if (window.pendingReject) { var r2 = window.pendingReject; window.pendingResolve = null; window.pendingReject = null; r2(err instanceof Error ? err : new Error('Captcha fail')); }
+      },
+      onError: function(err) {
+        log('onError: ' + err);
+        if (window.pendingReject) { var r = window.pendingReject; window.pendingResolve = null; window.pendingReject = null; r(err instanceof Error ? err : new Error('Captcha error')); }
+      }
+    });
+    window.captchaInstance = { configKey: config.configKey, instancePromise: window.captchaInstancePromise };
+  } catch (e) {
+    window.captchaInstance = null;
+    throw e;
+  }
+  return window.captchaInstance;
+}
+
+async function solveCaptcha(timeoutMs, config) {
+  if (!config) {
+    log('Fetching config...');
+    var resp = await fetch(window.CONFIG_URL);
+    var json = await resp.json();
+    if (json.code !== 0 || !json.data || !json.data.configs || !json.data.configs.captcha) {
+      throw new Error('Invalid config response: code=' + json.code);
+    }
+    config = json.data.configs.captcha;
+    if (!config.enabled) throw new Error('Captcha disabled');
+  }
+  window.__captchaConfig = config;
+  log('Config: region=' + config.region + ' prefix=' + config.prefix + ' sceneId=' + config.sceneId);
+  var configKey = [config.region, config.prefix, config.sceneId, 'popup', ''].join('::');
+  var inst = await initCaptchaInstance({ region: config.region, prefix: config.prefix, sceneId: config.sceneId, mode: 'popup', configKey: configKey });
+  await ensureMinInterval();
+  var instance = await waitForInstance(inst.instancePromise, window.INSTANCE_TIMEOUT_MS);
+
+  var param = await new Promise(function(resolve, reject) {
+    window.pendingResolve = resolve;
+    window.pendingReject = reject;
+    if (typeof instance.startTracelessVerification === 'function') {
+      log('startTracelessVerification');
+      instance.startTracelessVerification();
+    } else if (typeof instance.show === 'function') {
+      log('show');
+      instance.show();
+    } else {
+      log('button click');
+      document.getElementById('captcha-btn').click();
+    }
+  });
+  return param;
+}
+
+// 暴露给外部调用（等待 SDK 就绪）
+window.__solveCaptcha = function(timeoutMs, config) {
+  window.__solveResult = null;
+  (async function() {
+    try {
+      if (!window.__sdkReady) {
+        log('waiting for SDK...');
+        await new Promise(function(resolve) {
+          var check = setInterval(function() {
+            if (window.__sdkReady) { clearInterval(check); resolve(); }
+          }, 100);
+        });
+      }
+      var p = await solveCaptcha(timeoutMs, config);
+      window.__solveResult = { ok: true, param: p };
+    } catch(e) {
+      window.__solveResult = { ok: false, error: String(e) };
+    }
+  })();
+  return 'started';
+};
+
+window.__solverReady = true;
+log('solver script loaded');
+</script>
+<!-- SDK 走 Python 服务反代，避免跨域问题 -->
+<script src="/internal/aliyun-sdk" onload="onSdkLoad()"></script>
+</head>
+<body>
+<div class="captcha-hidden">
+  <div id="captcha-mount"></div>
+</div>
+<button id="captcha-btn" tabindex="-1" aria-hidden="true"></button>
+</body>
+</html>

@@ -9,6 +9,8 @@ import secrets
 
 import httpx
 
+from . import settings
+
 
 class ZaiAuthFlow:
     def __init__(self, api_base: str = "https://zcode.z.ai/api/v1") -> None:
@@ -16,7 +18,7 @@ class ZaiAuthFlow:
         self.poll_token = secrets.token_hex(32)
 
     async def init(self) -> tuple[str, str]:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=30, verify=settings.TLS_VERIFY) as client:
             res = await client.post(
                 f"{self.api_base}/oauth/cli/init",
                 headers={
@@ -33,7 +35,7 @@ class ZaiAuthFlow:
         return flow_id, authorize_url
 
     async def poll(self, flow_id: str) -> dict:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=30, verify=settings.TLS_VERIFY) as client:
             res = await client.get(
                 f"{self.api_base}/oauth/cli/poll/{flow_id}",
                 headers={"Authorization": f"Bearer {self.poll_token}"},
@@ -43,7 +45,7 @@ class ZaiAuthFlow:
 
     async def exchange_api_key(self, access_token: str) -> str:
         """OAuth access_token → 业务 token → 机构/项目 → API Key。"""
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=30, verify=settings.TLS_VERIFY) as client:
             login = await client.post(
                 "https://api.z.ai/api/auth/z/login",
                 headers={"Content-Type": "application/json"},

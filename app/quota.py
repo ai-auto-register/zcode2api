@@ -33,7 +33,7 @@ async def fetch_quota(account: Account) -> dict:
     base = settings.ZCODE_BILLING_BASE
     result: dict = {}
 
-    async with httpx.AsyncClient(timeout=20) as client:
+    async with httpx.AsyncClient(timeout=20, verify=settings.TLS_VERIFY) as client:
         async def _get(path: str):
             try:
                 return await client.get(f"{base}{path}", headers=headers)

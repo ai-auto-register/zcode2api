@@ -27,6 +27,84 @@ from ..system_prompt import inject_official_system, apply_forgetting_directive
 
 router = APIRouter()
 
+
+class _CmShim:
+    """伪装 httpx stream 的上下文管理器：持有一个异步清理回调。"""
+    def __init__(self, aclose):
+        self._aclose = aclose
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        if self._aclose:
+            try:
+                await self._aclose()
+            except Exception:
+                pass
+
+
+class _ClientShim:
+    """伪装 httpx.AsyncClient，formatter 在 finally 里调用 aclose()。"""
+    async def aclose(self):
+        pass
+
+
+class _RnetResponseShim:
+    """把 rnet Response 包装成 httpx.Response 兼容接口（status_code/aread/aiter_bytes/aclose）。"""
+    def __init__(self, rnet_resp):
+        self._resp = rnet_resp
+        sc = rnet_resp.status_code
+        self.status_code = sc.as_int() if hasattr(sc, "as_int") else int(sc)
+        # rnet HeaderMap 的 .get() 需要 bytes 默认值，转成普通 dict 避免 TypeError
+        try:
+            raw_hdrs = list(rnet_resp.headers.items()) if hasattr(rnet_resp.headers, "items") else []
+            self.headers = {}
+            for k, v in raw_hdrs:
+                ks = k.decode("utf-8") if isinstance(k, (bytes, bytearray)) else str(k)
+                vs = v.decode("utf-8") if isinstance(v, (bytes, bytearray)) else str(v)
+                self.headers[ks] = vs
+        except Exception:
+            self.headers = {}
+
+    async def aread(self) -> bytes:
+        return await self._resp.bytes()
+
+    async def aiter_bytes(self):
+        stream = self._resp.stream()
+        async for chunk in stream:
+            yield chunk
+
+    async def aclose(self):
+        try:
+            await self._resp.close()
+        except Exception:
+            pass
+
+
+async def _open_upstream(url: str, headers: dict, payload: bytes, body: dict, provider: str):
+    """打开到上游的流式请求，返回 (resp, cm, client)。
+
+    zai provider 用 rnet (Chrome131) 发请求，与求解环境 TLS/UA/出口 IP 完全一致；
+    bigmodel provider 用 httpx 直连。
+    """
+    if provider == "zai" and settings.SOLVER_SERVER_ENABLED:
+        from ..rnet_client import rnet_client
+        rnet_resp = await rnet_client.stream_post(url, headers, body)
+        shim = _RnetResponseShim(rnet_resp)
+        async def _close():
+            await shim.aclose()
+        return shim, _CmShim(_close), _ClientShim()
+
+    client = httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=30.0, read=None, write=120.0, pool=30.0),
+        verify=settings.TLS_VERIFY,
+    )
+    cm = client.stream("POST", url, headers=headers, content=payload)
+    resp = await cm.__aenter__()
+    return resp, cm, client
+
+
 MAX_CAPTCHA_RETRIES = 3
 MAX_ACCOUNT_ATTEMPTS = 5
 
@@ -176,14 +254,16 @@ async def _try_account(req_id: str, account: Account, body: dict, incoming_heade
             logs.warn(req_id, f"账号 {account.name} 凭证无效，切换下一个")
             return _NEXT_ACCOUNT
 
-        client = httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=None, write=120.0, pool=30.0))
-        cm = client.stream("POST", url, headers=headers, content=payload)
+        client: object | None = None
         try:
-            resp = await cm.__aenter__()
+            resp, cm, client = await _open_upstream(url, headers, payload, body, account.provider)
         except httpx.HTTPError as err:
-            await client.aclose()
             _mark(account, Status.COOLING, f"连接失败: {err}")
             logs.warn(req_id, f"账号 {account.name} 连接失败，切换下一个")
+            return _NEXT_ACCOUNT
+        except Exception as err:  # Node 反代连接错误等
+            _mark(account, Status.COOLING, f"连接失败: {err}")
+            logs.warn(req_id, f"账号 {account.name} 连接失败（反代），切换下一个")
             return _NEXT_ACCOUNT
 
         status_code = resp.status_code

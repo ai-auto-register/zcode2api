@@ -54,11 +54,33 @@ CAPTCHA_CONFIG_CACHE_TTL = _int("CAPTCHA_CONFIG_CACHE_TTL", 600_000)  # ms
 REVERSE_URL = os.getenv("REVERSE_URL", "").strip().rstrip("/")
 
 # 验证码求解（无浏览器：Node + jsdom 模拟浏览器环境，运行阿里云无痕 SDK）
+# 求解后端：jsdom（默认，速度快但可能被设备指纹检测） | camoufox（真实浏览器指纹，通过率高）
+CAPTCHA_SOLVER = os.getenv("ZCODE_CAPTCHA_SOLVER", "jsdom").strip().lower()
 NODE_PATH = os.getenv("ZCODE_NODE_PATH", "node")
 CAPTCHA_SOLVER_DIR = ROOT_DIR / "captcha_node"
 CAPTCHA_SOLVER_JS = CAPTCHA_SOLVER_DIR / "solver.js"
 CAPTCHA_SOLVE_RETRIES = _int("ZCODE_CAPTCHA_RETRIES", 4)
 CAPTCHA_SOLVE_TIMEOUT = _int("ZCODE_CAPTCHA_TIMEOUT", 40)  # 每次求解超时（秒）
+
+# camoufox 求解器（真实浏览器环境，绕过阿里云设备指纹检测）
+# Camoufox 无头模式：1=无头（默认） | 0=有头（调试用）
+CAMOUFOX_HEADLESS = os.getenv("ZCODE_CAMOUFOX_HEADLESS", "1").strip() not in ("0", "false", "False", "")
+# camoufox 求解页面超时（秒）
+CAMOUFOX_SOLVE_TIMEOUT = _int("ZCODE_CAMOUFOX_TIMEOUT", 60)
+# camoufox 浏览器池大小（常驻浏览器实例数，并发求解时提高吞吐）
+CAMOUFOX_POOL_SIZE = max(1, _int("ZCODE_CAMOUFOX_POOL_SIZE", 1))
+
+# Node 求解/反代常驻 HTTP 服务
+# 启用后：Python 通过 HTTP 调 Node 的 /solve 与 /messages；不再每次 spawn 子进程
+SOLVER_SERVER_ENABLED = os.getenv("ZCODE_SOLVER_SERVER", "1").strip() not in ("0", "false", "False", "")
+SOLVER_SERVER_JS = CAPTCHA_SOLVER_DIR / "server.js"
+# 端口：留空时由 Python 自动选取一个空闲端口
+SOLVER_PORT = _int("ZCODE_SOLVER_PORT", 0)
+SOLVER_HOST = "127.0.0.1"
+# zcode 上游请求是否经 rnet (Chrome131) 发送（zai provider；bigmodel 仍由 Python httpx 直连）
+SOLVER_PROXY_ZAI = os.getenv("ZCODE_SOLVER_PROXY_ZAI", "1").strip() not in ("0", "false", "False", "")
+# 调用 Node /solve 的 HTTP 超时（秒）
+SOLVER_HTTP_TIMEOUT = _int("ZCODE_SOLVER_HTTP_TIMEOUT", 60)
 
 # ── 用量监控 ─────────────────────────────────────────────────────────────────
 # 后台自动刷新账号额度的间隔（秒）。0 表示关闭后台轮询，仅按需刷新。
@@ -69,6 +91,10 @@ COOLING_SECONDS = _int("ZCODE_COOLING_SECONDS", 300)
 # ── 代理 ─────────────────────────────────────────────────────────────────────
 # Node 验证码求解器的 HTTP(S) 代理
 PROXY_URL = os.getenv("PROXY_URL", "").strip()
+
+# ── TLS 校验 ───────────────────────────────────────────────────────────────
+# 禁用 TLS 证书校验（调试 / 反代自签证书用）。1=禁用，0=启用校验（默认）
+TLS_VERIFY = os.getenv("ZCODE_TLS_VERIFY", "1").strip() not in ("0", "false", "False", "")
 
 # ── 上游端点 ─────────────────────────────────────────────────────────────────
 UPSTREAM = {

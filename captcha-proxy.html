@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ZCode API Captcha Proxy</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #1a1a2e; color: #e0e0e0; min-height: 100vh; padding: 20px; }
+  h1 { text-align: center; margin-bottom: 20px; color: #00d4ff; font-size: 20px; }
+  .container { max-width: 800px; margin: 0 auto; }
+  .card { background: #16213e; border: 1px solid #0f3460; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+  .card h2 { color: #00d4ff; font-size: 14px; margin-bottom: 12px; border-bottom: 1px solid #0f3460; padding-bottom: 8px; }
+  label { display: block; font-size: 12px; color: #a0a0a0; margin-bottom: 4px; margin-top: 8px; }
+  input, textarea, select { width: 100%; background: #0f3460; border: 1px solid #1a4080; color: #e0e0e0; border-radius: 4px; padding: 8px; font-size: 13px; font-family: 'Consolas', monospace; }
+  input[readonly] { opacity: 0.7; }
+  textarea { resize: vertical; min-height: 80px; }
+  .row { display: flex; gap: 8px; }
+  .row > div { flex: 1; }
+  button { background: #00d4ff; color: #1a1a2e; border: none; border-radius: 4px; padding: 10px 20px; cursor: pointer; font-weight: bold; font-size: 13px; margin-top: 12px; margin-right: 8px; }
+  button:hover { background: #00b8d4; }
+  button:disabled { background: #555; cursor: not-allowed; }
+  .status { margin-top: 8px; font-size: 12px; }
+  .status.ok { color: #4caf50; }
+  .status.err { color: #f44336; }
+  .status.warn { color: #ff9800; }
+  #log { background: #0a0a1a; border: 1px solid #0f3460; border-radius: 4px; padding: 8px; font-family: 'Consolas', monospace; font-size: 11px; max-height: 300px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; }
+  .captcha-hidden { position: fixed; left: 0; top: 0; z-index: 2147483647; width: 0; height: 0; overflow: visible; pointer-events: none; }
+  .captcha-hidden > div { position: absolute; left: 0; top: 0; width: 0; height: 0; overflow: visible; }
+  #captcha-result { background: #0f3460; border-radius: 4px; padding: 8px; margin-top: 8px; font-family: 'Consolas', monospace; font-size: 12px; word-break: break-all; min-height: 24px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>ZCode API Captcha Proxy</h1>
+
+  <div class="card">
+    <h2>1. Captcha Config (auto-fetch from ZCode API)</h2>
+    <div class="row">
+      <div>
+        <label>Region</label>
+        <input id="captchaRegion" value="" readonly>
+      </div>
+      <div>
+        <label>Prefix</label>
+        <input id="captchaPrefix" value="" readonly>
+      </div>
+      <div>
+        <label>SceneId</label>
+        <input id="captchaSceneId" value="" readonly>
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label>Mode</label>
+        <select id="captchaMode">
+          <option value="popup">popup</option>
+        </select>
+      </div>
+      <div>
+        <label>Language</label>
+        <input id="captchaLang" value="" placeholder="optional">
+      </div>
+    </div>
+    <button onclick="fetchCaptchaConfig()">Fetch Config</button>
+    <button onclick="startCaptcha()" id="btnVerify" disabled>Verify Captcha</button>
+    <div id="captchaStatus" class="status"></div>
+    <div>
+      <label>captchaVerifyParam (result)</label>
+      <div id="captcha-result">-</div>
+    </div>
+    <button onclick="copyResult()">Copy</button>
+  </div>
+
+  <div class="card">
+    <h2>2. Send API Request</h2>
+    <label>API URL</label>
+    <input id="apiUrl" value="https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages">
+    <label>Access Token (Bearer)</label>
+    <input id="accessToken" type="password" value="" placeholder="Your OAuth access token">
+    <label>Request Body (JSON)</label>
+    <textarea id="reqBody">{
+  "model": "claude-sonnet-4-20250514",
+  "max_tokens": 1024,
+  "messages": [{"role": "user", "content": "hello"}]
+}</textarea>
+    <button onclick="sendRequest()">Send Request</button>
+    <div id="requestStatus" class="status"></div>
+  </div>
+
+  <div class="card">
+    <h2>3. Response</h2>
+    <div>
+      <label>Status</label>
+      <div id="respStatus" style="padding:4px;font-size:12px;">-</div>
+    </div>
+    <label>Headers</label>
+    <textarea id="respHeaders" readonly style="min-height:40px;">-</textarea>
+    <label>Body</label>
+    <textarea id="respBody" readonly style="min-height:120px;">-</textarea>
+  </div>
+
+  <div class="card">
+    <h2>Log</h2>
+    <div id="log"></div>
+  </div>
+</div>
+
+<div class="captcha-hidden">
+  <div id="captcha-mount"></div>
+  <button id="captcha-btn" tabindex="-1" aria-hidden="true" style="position:fixed;left:50%;top:50%;width:1px;height:1px;border:0;padding:0;opacity:0;"></button>
+</div>
+
+<script>
+const ALIYUN_CAPTCHA_SDK_URL = 'https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js';
+const CONFIG_URL = 'https://zcode.z.ai/api/v1/client/configs?platform=windows-x86_64&config_version=0.0.17';
+const INSTANCE_TIMEOUT_MS = 10000;
+const MIN_INTERVAL_MS = 2000;
+
+let captchaVerifyParam = null;
+let sdkLoadTime = 0;
+let captchaInstance = null;
+let captchaInstancePromise = null;
+let pendingResolve = null;
+let pendingReject = null;
+let isVerifying = false;
+
+function log(msg) {
+  const el = document.getElementById('log');
+  const ts = new Date().toISOString().slice(11, 23);
+  el.textContent += `[${ts}] ${msg}\n`;
+  el.scrollTop = el.scrollHeight;
+}
+
+function setStatus(id, msg, cls) {
+  const el = document.getElementById(id);
+  el.textContent = msg;
+  el.className = 'status ' + (cls || '');
+}
+
+async function fetchCaptchaConfig() {
+  setStatus('captchaStatus', 'Fetching config...', 'warn');
+  log(`GET ${CONFIG_URL}`);
+  try {
+    const resp = await fetch(CONFIG_URL);
+    const json = await resp.json();
+    if (json.code !== 0 || !json.data?.configs?.captcha) {
+      throw new Error(`Invalid response: code=${json.code}`);
+    }
+    const c = json.data.configs.captcha;
+    if (!c.enabled) {
+      throw new Error('Captcha is disabled in config');
+    }
+    document.getElementById('captchaRegion').value = c.region || '';
+    document.getElementById('captchaPrefix').value = c.prefix || '';
+    document.getElementById('captchaSceneId').value = c.sceneId || '';
+    document.getElementById('btnVerify').disabled = false;
+    setStatus('captchaStatus', `Config loaded: region=${c.region} prefix=${c.prefix} sceneId=${c.sceneId}`, 'ok');
+    log(`Captcha config: enabled=${c.enabled} region=${c.region} prefix=${c.prefix} sceneId=${c.sceneId}`);
+  } catch (e) {
+    setStatus('captchaStatus', `Fetch failed: ${e.message}`, 'err');
+    log(`Config fetch error: ${e.message}`);
+  }
+}
+
+function extractCaptchaVerifyParam(data) {
+  if (typeof data === 'object' && data !== null) {
+    const val = (typeof data.captchaVerifyParam === 'string' ? data.captchaVerifyParam
+      : typeof data.CaptchaVerifyParam === 'string' ? data.CaptchaVerifyParam
+      : undefined);
+    return val?.trim() || undefined;
+  }
+  return undefined;
+}
+
+function extractVerifyMeta(data) {
+  if (typeof data !== 'object' || !data) return null;
+  const vc = typeof data.verifyCode === 'string' ? data.verifyCode
+    : typeof data.VerifyCode === 'string' ? data.VerifyCode : undefined;
+  return {
+    success: typeof data.success === 'boolean' ? data.success : undefined,
+    verifyResult: typeof data.verifyResult === 'boolean' ? data.verifyResult : undefined,
+    verifyCode: vc,
+  };
+}
+
+function isTerminalPass(data) {
+  const m = extractVerifyMeta(data);
+  return m ? (m.success === true && m.verifyResult === true || m.verifyCode === 'T006') : false;
+}
+
+function loadSdk() {
+  return new Promise((resolve, reject) => {
+    if (typeof window.initAliyunCaptcha === 'function') { resolve(); return; }
+    const existing = document.querySelector(`script[src="${ALIYUN_CAPTCHA_SDK_URL}"]`);
+    if (existing) {
+      existing.addEventListener('load', () => resolve(), { once: true });
+      existing.addEventListener('error', () => reject(new Error('Failed to load captcha SDK')), { once: true });
+      return;
+    }
+    const s = document.createElement('script');
+    s.src = ALIYUN_CAPTCHA_SDK_URL;
+    s.async = true;
+    s.onload = () => { sdkLoadTime = Date.now(); resolve(); };
+    s.onerror = () => reject(new Error('Failed to load captcha SDK'));
+    document.head.appendChild(s);
+  });
+}
+
+async function waitForInstance(promise, timeoutMs) {
+  return Promise.race([
+    promise,
+    new Promise((_, rej) => setTimeout(() => rej(new Error(`Instance timed out after ${timeoutMs}ms`)), timeoutMs))
+  ]);
+}
+
+async function ensureMinInterval() {
+  if (!sdkLoadTime) return;
+  const elapsed = Date.now() - sdkLoadTime;
+  if (elapsed >= MIN_INTERVAL_MS) return;
+  await new Promise(r => setTimeout(r, MIN_INTERVAL_MS - elapsed));
+}
+
+async function initCaptchaInstance(config) {
+  await loadSdk();
+  const initFn = window.initAliyunCaptcha;
+  if (typeof initFn !== 'function') throw new Error('Captcha SDK is unavailable');
+
+  if (captchaInstance && captchaInstance.configKey === config.configKey) {
+    return captchaInstance;
+  }
+
+  let res, rej;
+  captchaInstancePromise = new Promise((a, b) => { res = a; rej = b; });
+
+  window.AliyunCaptchaConfig = { region: config.region, prefix: config.prefix };
+
+  try {
+    log(`initAliyunCaptcha: sceneId=${config.sceneId}, mode=${config.mode}`);
+    initFn({
+      SceneId: config.sceneId,
+      mode: config.mode,
+      language: config.language || undefined,
+      captchaLogoImg: undefined,
+      showErrorTip: false,
+      element: '#captcha-mount',
+      button: '#captcha-btn',
+      getInstance: (inst) => {
+        log('captcha instance ready');
+        res(inst);
+      },
+      success: (param) => {
+        log(`captcha success, param length=${param.length}`);
+        if (pendingResolve) {
+          const r = pendingResolve;
+          pendingResolve = null;
+          pendingReject = null;
+          r(param);
+        }
+      },
+      fail: (err) => {
+        log(`captcha fail: ${JSON.stringify(err)}`);
+        const param = extractCaptchaVerifyParam(err);
+        if (isTerminalPass(err) && param) {
+          log('terminal pass from fail callback');
+          if (pendingResolve) {
+            const r = pendingResolve;
+            pendingResolve = null;
+            pendingReject = null;
+            r(param);
+          }
+          return;
+        }
+        if (pendingReject) {
+          const r = pendingReject;
+          pendingResolve = null;
+          pendingReject = null;
+          r(err instanceof Error ? err : new Error('Captcha verification failed'));
+        }
+      },
+      onError: (err) => {
+        log(`captcha onError: ${err}`);
+        if (pendingReject) {
+          const r = pendingReject;
+          pendingResolve = null;
+          pendingReject = null;
+          r(err instanceof Error ? err : new Error('Captcha error'));
+        }
+      }
+    });
+
+    captchaInstance = {
+      configKey: config.configKey,
+      instancePromise: captchaInstancePromise
+    };
+  } catch (e) {
+    captchaInstance = null;
+    throw e;
+  }
+
+  return captchaInstance;
+}
+
+async function startCaptcha() {
+  if (isVerifying) { log('Already verifying'); return; }
+
+  const region = document.getElementById('captchaRegion').value.trim();
+  const prefix = document.getElementById('captchaPrefix').value.trim();
+  const sceneId = document.getElementById('captchaSceneId').value.trim();
+  const mode = document.getElementById('captchaMode').value;
+  const language = document.getElementById('captchaLang').value.trim();
+
+  if (!region || !prefix || !sceneId) {
+    setStatus('captchaStatus', 'Click "Fetch Config" first', 'err');
+    return;
+  }
+
+  isVerifying = true;
+  setStatus('captchaStatus', 'Processing...', 'warn');
+  document.getElementById('captcha-result').textContent = '-';
+  log('Starting captcha verification...');
+
+  const configKey = [region, prefix, sceneId, mode, language || '', ''].join('::');
+
+  try {
+    const inst = await initCaptchaInstance({ region, prefix, sceneId, mode, language, configKey });
+    await ensureMinInterval();
+
+    const instance = await waitForInstance(inst.instancePromise, INSTANCE_TIMEOUT_MS);
+
+    const param = await new Promise((resolve, reject) => {
+      pendingResolve = resolve;
+      pendingReject = reject;
+
+      if (typeof instance.startTracelessVerification === 'function') {
+        log('Trying traceless verification...');
+        instance.startTracelessVerification();
+      } else if (typeof instance.show === 'function') {
+        log('Showing interactive captcha...');
+        instance.show();
+      } else {
+        log('Triggering button click...');
+        document.getElementById('captcha-btn').click();
+      }
+    });
+
+    captchaVerifyParam = param;
+    document.getElementById('captcha-result').textContent = param;
+    setStatus('captchaStatus', 'Verification successful!', 'ok');
+    log(`Got captchaVerifyParam: ${param.substring(0, 80)}...`);
+
+  } catch (e) {
+    log(`Error: ${e.message}`);
+    setStatus('captchaStatus', `Failed: ${e.message}`, 'err');
+    pendingResolve = null;
+    pendingReject = null;
+  } finally {
+    isVerifying = false;
+  }
+}
+
+function copyResult() {
+  const text = document.getElementById('captcha-result').textContent;
+  if (!text || text === '-') return;
+  navigator.clipboard.writeText(text).then(() => log('Copied!')).catch(() => log('Copy failed'));
+}
+
+async function sendRequest() {
+  const url = document.getElementById('apiUrl').value.trim();
+  const token = document.getElementById('accessToken').value.trim();
+  const body = document.getElementById('reqBody').value;
+
+  if (!url) { setStatus('requestStatus', 'URL required', 'err'); return; }
+
+  setStatus('requestStatus', 'Sending...', 'warn');
+  document.getElementById('respStatus').textContent = '-';
+  document.getElementById('respHeaders').value = '-';
+  document.getElementById('respBody').value = '-';
+
+  const headers = {
+    'Content-Type': 'application/json',
+  };
+
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
+
+  if (captchaVerifyParam) {
+    headers['x-aliyun-captcha-verify-param'] = captchaVerifyParam;
+    log(`Adding x-aliyun-captcha-verify-param header: ${captchaVerifyParam.substring(0, 50)}...`);
+  } else {
+    log('No captchaVerifyParam available, sending without captcha header');
+  }
+
+  try {
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers,
+      body,
+    });
+
+    const respHeaders = [];
+    resp.headers.forEach((v, k) => respHeaders.push(`${k}: ${v}`));
+
+    document.getElementById('respStatus').textContent = `${resp.status} ${resp.statusText}`;
+    document.getElementById('respHeaders').value = respHeaders.join('\n');
+
+    const respText = await resp.text();
+    try {
+      document.getElementById('respBody').value = JSON.stringify(JSON.parse(respText), null, 2);
+    } catch {
+      document.getElementById('respBody').value = respText;
+    }
+
+    setStatus('requestStatus', `Completed: ${resp.status}`, resp.ok ? 'ok' : 'err');
+    log(`Response: ${resp.status} ${resp.statusText}`);
+  } catch (e) {
+    setStatus('requestStatus', `Request failed: ${e.message}`, 'err');
+    log(`Request error: ${e.message}`);
+  }
+}
+
+fetchCaptchaConfig();
+</script>
+</body>
+</html>

@@ -15,9 +15,18 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# ── Node.js（供无浏览器无痕验证求解器使用）──────────────────────────────────
+# ── 系统依赖 ────────────────────────────────────────────────────────────────
+# Node.js：无痕验证求解器子进程
+# Camoufox（基于 Firefox）headless 运行所需的 GTK/图形/X11 共享库
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl ca-certificates gnupg \
+    && apt-get install -y --no-install-recommends \
+        curl ca-certificates gnupg \
+        libgtk-3-0 libasound2 libdbus-glib-1-2 libx11-xcb1 libxcb-shm0 \
+        libxcomposite1 libxdamage1 libxrandr2 libxtst6 libxss1 libxcursor1 \
+        libxinerama1 libxi6 libxfixes3 libegl1 libgl1 libnss3 libnspr4 \
+        libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 \
+        libatspi2.0-0 libxshmfence1 libpango-1.0-0 libcairo2 \
+        libgdk-pixbuf-2.0-0 \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && apt-get purge -y curl gnupg \
@@ -30,6 +39,10 @@ COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --no-install-project
 
+# ── Camoufox 浏览器二进制（camoufox 求解器需要，约 ~300MB）────────────────────
+# 放在源码复制前，避免改源码触发重新下载
+RUN camoufox fetch
+
 # ── 求解器 Node 依赖（独立分层）─────────────────────────────────────────────
 COPY captcha_node/package.json captcha_node/package-lock.json ./captcha_node/
 RUN cd captcha_node && npm ci --omit=dev
@@ -38,9 +51,6 @@ RUN cd captcha_node && npm ci --omit=dev
 COPY . .
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev
-
-# ── Camoufox 浏览器二进制（camoufox 求解器需要，约 ~300MB）────────────────────
-RUN camoufox fetch
 
 # 账号 / 设置持久化目录（建议挂载到宿主机卷）
 VOLUME ["/data"]
